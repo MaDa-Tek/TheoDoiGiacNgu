@@ -165,7 +165,7 @@ bool readSHT30(float &temperature, float &humidity) {
   float t  = -45.0f + 175.0f * ((float)rawT / 65535.0f);
 
   // Áp dụng offset nếu bạn muốn điều chỉnh
-  t += TEMP_OFFSET;
+//  t += TEMP_OFFSET;
 
   // Gán kết quả
   temperature = t;
@@ -218,7 +218,7 @@ uint16_t lastIR = 0;
 float g_temperature = NAN;
 float g_humidity    = NAN;
 uint32_t lastSHTRead = 0;
-const uint32_t SHT_INTERVAL_MS = 500;   // đọc mỗi 0.5 giây
+const uint32_t SHT_INTERVAL_MS = 200;   // đọc mỗi 0.5 giây
 
 // ================== BUTTON DEBOUNCE & MODE ==================
 // Dùng đúng kiểu Arduino debounce
@@ -495,7 +495,7 @@ void loop() {
   }
 
   // 3) Cập nhật OLED mỗi giây
-  if (millis() - lastDisplayUpdate > 1000) {
+  if (millis() - lastDisplayUpdate > 500) {
     lastDisplayUpdate = millis();
 
     // === CLOCK MODE ===
@@ -570,7 +570,7 @@ void loop() {
     bool alertTemp  = false;
     bool alertHRLow = false;
 
-    if (!isnan(temp) && temp > 31.0f) {
+    if (!isnan(temp) && temp > 35.0f) {
       alert = true;
       alertTemp = true;
     }
@@ -592,7 +592,7 @@ void loop() {
         u8g2.setFont(u8g2_font_6x10_tf);
         int y2 = 40;
         if (alertTemp) {
-          u8g2.drawStr(0, y2, "Nhiet do > 31C");
+          u8g2.drawStr(0, y2, "Nhiet do > 33C");
           y2 += 12;
         }
         if (alertHRLow) {
