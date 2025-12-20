@@ -696,4 +696,5 @@ void loop() {
 
     u8g2.sendBuffer();
   }
-}
+
+)
