@@ -1,8 +1,9 @@
-#include <Wire.h> 
+#include <Wire.h>
 #include <SPI.h>
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <time.h>
+#include <math.h>
 
 // ================== I2C ADDRESSES ==================
 #define MAX30100_ADDR 0x57
@@ -13,25 +14,24 @@
 #define BUTTON_PIN 26   // GPIO26
 
 // ================== WiFi & Thời gian thực ==================
-const char* ssid     = "Nha 05 - P401";    
-const char* password = "66668888";         
+const char* ssid     = "MADATEK";
+const char* password = "Madatek68686868";
 
 // Việt Nam GMT+7
 const long  gmtOffset_sec      = 7 * 3600;
 const int   daylightOffset_sec = 0;
+
 // hiệu chỉnh sht30
-const float TEMP_OFFSET = -1.5f;   // chỉnh cho phù hợp với thực tế
-const float HUM_OFFSET  = 0.0f;    // 
-float t;
-float rh;
+const float TEMP_OFFSET = -1.5f;
+const float HUM_OFFSET  = 0.0f;
 
 // ================== OLED SH1106 SPI (U8g2) ==================
 // ESP32: SCK = 18, MOSI = 23, DC = 17, RST = 16, CS = none (GND)
 U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(
-  U8G2_R0,           // rotation
-  U8X8_PIN_NONE,     // CS (không có chân CS)
-  17,                // DC  -> GPIO17
-  16                 // RST -> GPIO16
+  U8G2_R0,
+  U8X8_PIN_NONE, // CS none
+  17,            // DC
+  16             // RST
 );
 
 // ================== MAX30100 REGISTERS ==================
@@ -46,7 +46,7 @@ U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(
 // ================== ADXL345 REGISTERS ==================
 #define ADXL345_POWER_CTL   0x2D
 #define ADXL345_DATA_FORMAT 0x31
-#define ADXL345_DATAX0      0x32  // X0, X1, Y0, Y1, Z0, Z1
+#define ADXL345_DATAX0      0x32
 
 // ================== I2C HELPER ==================
 void i2cWrite8(uint8_t addr, uint8_t reg, uint8_t val) {
@@ -61,9 +61,7 @@ uint8_t i2cRead8(uint8_t addr, uint8_t reg) {
   Wire.write(reg);
   Wire.endTransmission(false);
   Wire.requestFrom(addr, (uint8_t)1);
-  if (Wire.available()) {
-    return Wire.read();
-  }
+  if (Wire.available()) return Wire.read();
   return 0;
 }
 
@@ -73,47 +71,36 @@ void i2cReadBytes(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
   Wire.endTransmission(false);
   Wire.requestFrom(addr, len);
   uint8_t i = 0;
-  while (Wire.available() && i < len) {
-    buf[i++] = Wire.read();
-  }
+  while (Wire.available() && i < len) buf[i++] = Wire.read();
 }
 
 // ================== MAX30100 INIT & READ ==================
 bool initMAX30100() {
-  // Reset FIFO
   i2cWrite8(MAX30100_ADDR, MAX30100_FIFO_WR_PTR, 0x00);
   i2cWrite8(MAX30100_ADDR, MAX30100_OVF_COUNTER, 0x00);
   i2cWrite8(MAX30100_ADDR, MAX30100_FIFO_RD_PTR, 0x00);
 
-  // SpO2 mode
-  i2cWrite8(MAX30100_ADDR, MAX30100_MODE_CONFIG, 0x03);
-
-  // SPO2_CONFIG: hi-res, 100 Hz, 1600us
-  i2cWrite8(MAX30100_ADDR, MAX30100_SPO2_CONFIG, 0x4F);
-
-  // LED current: RED=IR=0x0F
-  i2cWrite8(MAX30100_ADDR, MAX30100_LED_CONFIG, 0xFF);
+  i2cWrite8(MAX30100_ADDR, MAX30100_MODE_CONFIG, 0x03);  // SpO2 mode
+  i2cWrite8(MAX30100_ADDR, MAX30100_SPO2_CONFIG, 0x4F);  // hi-res, 100Hz, 1600us
+  i2cWrite8(MAX30100_ADDR, MAX30100_LED_CONFIG, 0xFF);   // RED/IR current
 
   delay(10);
   uint8_t mode = i2cRead8(MAX30100_ADDR, MAX30100_MODE_CONFIG);
   return (mode & 0x07) == 0x03;
 }
 
-// Đọc 1 sample IR + RED từ FIFO (4 byte)
 bool readMAX30100Raw(uint16_t &ir, uint16_t &red) {
   uint8_t buf[4];
   i2cReadBytes(MAX30100_ADDR, MAX30100_FIFO_DATA, buf, 4);
-
   ir  = ((uint16_t)buf[0] << 8) | buf[1];
   red = ((uint16_t)buf[2] << 8) | buf[3];
-
   return true;
 }
 
 // ================== ADXL345 INIT & READ ==================
 bool initADXL345() {
   i2cWrite8(ADXL345_ADDR, ADXL345_DATA_FORMAT, 0x08); // full-res, ±2g
-  i2cWrite8(ADXL345_ADDR, ADXL345_POWER_CTL, 0x08);   // measure = 1
+  i2cWrite8(ADXL345_ADDR, ADXL345_POWER_CTL,   0x08); // measure=1
   delay(10);
   uint8_t pctl = i2cRead8(ADXL345_ADDR, ADXL345_POWER_CTL);
   return (pctl & 0x08) != 0;
@@ -127,55 +114,39 @@ void readADXL345(float &ax, float &ay, float &az) {
   int16_t y = (int16_t)((buf[3] << 8) | buf[2]);
   int16_t z = (int16_t)((buf[5] << 8) | buf[4]);
 
+  // Full-res: ~3.9mg/LSB @ ±2g
   const float scale = 0.0039f;
   ax = x * scale;
   ay = y * scale;
   az = z * scale;
 }
 
-// ================== SHT30 READ (thuần thanh ghi) ==================
+// ================== SHT30 READ ==================
 bool readSHT30(float &temperature, float &humidity) {
-  // Gửi lệnh đo single-shot high repeatability: 0x2400
   Wire.beginTransmission(SHT30_ADDR);
   Wire.write(0x24);
   Wire.write(0x00);
-  if (Wire.endTransmission() != 0) {
-    return false;
-  }
+  if (Wire.endTransmission() != 0) return false;
 
-  // Đợi sensor đo xong (datasheet: ~15 ms)
   delay(20);
 
-  // Đọc 6 byte: T_MSB, T_LSB, T_CRC, RH_MSB, RH_LSB, RH_CRC
   Wire.requestFrom(SHT30_ADDR, (uint8_t)6);
-  if (Wire.available() < 6) {
-    return false;
-  }
+  if (Wire.available() < 6) return false;
 
   uint8_t data[6];
-  for (int i = 0; i < 6; i++) {
-    data[i] = Wire.read();
-  }
+  for (int i = 0; i < 6; i++) data[i] = Wire.read();
 
-  // Ghép raw
   uint16_t rawT  = ((uint16_t)data[0] << 8) | data[1];
   uint16_t rawRH = ((uint16_t)data[3] << 8) | data[4];
 
-  // Tính nhiệt độ chuẩn theo datasheet
-  float t  = -45.0f + 175.0f * ((float)rawT / 65535.0f);
+  float t = -45.0f + 175.0f * ((float)rawT / 65535.0f);
+  t += TEMP_OFFSET;
 
-  // Áp dụng offset nếu bạn muốn điều chỉnh
-//  t += TEMP_OFFSET;
-
-  // Gán kết quả
   temperature = t;
-
-  // Nếu bạn không dùng RH thì giữ nguyên như cũ:
-  humidity = 100.0f * ((float)rawRH / 65535.0f);
+  humidity    = 100.0f * ((float)rawRH / 65535.0f) + HUM_OFFSET;
 
   return true;
 }
-
 
 // ================== THUẬT TOÁN HR + SpO2 ==================
 const int SAMPLE_INTERVAL_MS = 10;   // ~100 Hz
@@ -198,15 +169,14 @@ bool validSpO2 = false;
 bool fingerOnSensor = false;
 float dcIR_ema = 0;
 float acAbsAvg = 0;
-const float DC_ALPHA   = 0.95f;
-const float NOISE_ALPHA= 0.95f;
+const float DC_ALPHA    = 0.95f;
+const float NOISE_ALPHA = 0.95f;
 const uint32_t MIN_RR_MS     = 400;
 const uint32_t MAX_RR_MS     = 1500;
 const uint32_t REFRACTORY_MS = 300;
 const uint16_t IR_FINGER_ON  = 5000;
 const uint16_t IR_FINGER_OFF = 2000;
 
-// RR smoothing
 const int HR_AVG_N = 5;
 uint16_t rrIntervals[HR_AVG_N];
 int rrIndex = 0;
@@ -218,17 +188,16 @@ uint16_t lastIR = 0;
 float g_temperature = NAN;
 float g_humidity    = NAN;
 uint32_t lastSHTRead = 0;
-const uint32_t SHT_INTERVAL_MS = 200;   // đọc mỗi 0.5 giây
+const uint32_t SHT_INTERVAL_MS = 500;
 
 // ================== BUTTON DEBOUNCE & MODE ==================
-// Dùng đúng kiểu Arduino debounce
-int buttonState       = HIGH;  // trạng thái đã debounce (HIGH/LOW)
-int lastButtonReading = HIGH;  // lần đọc trước (raw)
+int buttonState       = HIGH;
+int lastButtonReading = HIGH;
 unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;  // ms
+const unsigned long debounceDelay = 50;
 
-// Chế độ hoạt động: TRUE = SENSOR, FALSE = CLOCK
-bool sensorMode = true;                              
+// TRUE = SENSOR, FALSE = CLOCK
+bool sensorMode = true;
 
 // ================== FLAGS & STATE ==================
 bool haveMAX  = false;
@@ -237,6 +206,19 @@ bool haveSHT  = false;
 bool sensorsInited = false;
 
 uint32_t lastDisplayUpdate = 0;
+
+// ================== ADXL ALERT (NEW) ==================
+// ================== ADXL ALERT (RUNG + VA ĐẬP CHUẨN) ==================
+float lastAx = NAN, lastAy = NAN, lastAz = NAN;
+float lastAccMag = NAN;  
+uint8_t accHitCount = 0;
+
+// Rung / lắc (Δ trục)
+#define ACC_RUNG_THRESHOLD   0.35f   // 0.25–0.45
+#define ACC_RUNG_CONFIRM     2
+
+// Va đập mạnh (|a|)
+#define ACC_IMPACT_THRESHOLD 2.5f    // g
 
 // ================== KHỞI TẠO WIFI + THỜI GIAN ==================
 void initWiFiAndTime() {
@@ -248,7 +230,6 @@ void initWiFiAndTime() {
   }
   Serial.println(" connected!");
 
-  // Cấu hình NTP
   configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Syncing time");
@@ -281,7 +262,7 @@ void sampleMaxAndUpdateHR() {
   int count = bufferFilled ? BUFFER_SIZE : bufferIndex;
   if (count < 20) return;
 
-  // PHÁT HIỆN CÓ / KHÔNG CÓ TAY
+  // finger detect
   if (!fingerOnSensor) {
     if (ir > IR_FINGER_ON) {
       fingerOnSensor = true;
@@ -310,7 +291,7 @@ void sampleMaxAndUpdateHR() {
     }
   }
 
-  // LỌC DC & TÍNH AC
+  // DC filter & AC magnitude
   if (dcIR_ema == 0) dcIR_ema = ir;
   else dcIR_ema = DC_ALPHA * dcIR_ema + (1.0f - DC_ALPHA) * ir;
 
@@ -396,7 +377,7 @@ void computeSpO2() {
   }
 
   float R = (acRED / dcRED) / (acIR / dcIR);
-  float s = 110.0f - 25.0f * R;  // xấp xỉ demo
+  float s = 110.0f - 25.0f * R;
 
   if (s > 100) s = 100;
   if (s < 50)  s = 50;
@@ -441,7 +422,6 @@ void loop() {
     if (reading != buttonState) {
       buttonState = reading;
 
-      // Nhấn nút (PULLUP -> LOW) => toggle mode
       if (buttonState == LOW) {
         sensorMode = !sensorMode;
         Serial.print("Mode changed to: ");
@@ -468,11 +448,15 @@ void loop() {
     Serial.print("SHT30: ");
     Serial.println(haveSHT ? "OK" : "FAIL");
 
-    // Lưu lần đầu đọc được (nếu OK) vào biến global
     if (haveSHT) {
       g_temperature = T;
       g_humidity    = H;
     }
+
+    // init baseline gia tốc để tránh alert ngay lần đầu
+    lastAx = lastAy = lastAz = NAN;
+    accHitCount = 0;
+
 
     sensorsInited = true;
     delay(200);
@@ -484,7 +468,7 @@ void loop() {
     sampleMaxAndUpdateHR();
   }
 
-  // 2b) Đọc SHT30 định kỳ (không phụ thuộc OLED)
+  // 2b) Đọc SHT30 định kỳ
   if (haveSHT && (millis() - lastSHTRead > SHT_INTERVAL_MS)) {
     lastSHTRead = millis();
     float T, H;
@@ -495,7 +479,7 @@ void loop() {
   }
 
   // 3) Cập nhật OLED mỗi giây
-  if (millis() - lastDisplayUpdate > 500) {
+  if (millis() - lastDisplayUpdate > 1000) {
     lastDisplayUpdate = millis();
 
     // === CLOCK MODE ===
@@ -545,7 +529,6 @@ void loop() {
       readADXL345(ax, ay, az);
     }
 
-    // Dùng giá trị toàn cục đã được cập nhật định kỳ
     float temp = g_temperature;
     float hum  = g_humidity;
 
@@ -566,18 +549,71 @@ void loop() {
     Serial.println(az, 2);
 
     // === CẢNH BÁO ===
-    bool alert      = false;
-    bool alertTemp  = false;
-    bool alertHRLow = false;
+    bool alert        = false;
+    bool alertTemp    = false;
+    bool alertHRLow   = false;
+    bool alertHRHIGH  = false;
+    bool alertRung = false;
+    bool alertImpact = false;
 
-    if (!isnan(temp) && temp > 35.0f) {
+
+    // Temp
+    if (!isnan(temp) && temp > 31.0f) {
       alert = true;
       alertTemp = true;
     }
+
+    // HR
     if (haveMAX && validHR && heartRate < 50.0f) {
       alert = true;
       alertHRLow = true;
     }
+    if (haveMAX && validHR && heartRate > 100.0f) {
+      alert = true;
+      alertHRHIGH = true;
+    }
+
+    // ===== ADXL345: CẢNH BÁO RUNG + VA ĐẬP =====
+    if (haveADXL) {
+
+    // --- RUNG / LẮC (Δ theo trục) ---
+      if (!isnan(lastAx)) {
+        float deltaAcc =
+        fabs(ax - lastAx) +
+        fabs(ay - lastAy) +
+        fabs(az - lastAz);
+
+      if (deltaAcc > ACC_RUNG_THRESHOLD)
+        accHitCount++;
+      else
+        accHitCount = 0;
+
+      if (accHitCount >= ACC_RUNG_CONFIRM) {
+        alert = true;
+        alertRung = true;
+      }
+    }
+
+    // --- VA ĐẬP MẠNH (|a| lớn) ---
+    float accMag = sqrt(ax*ax + ay*ay + az*az);
+
+    if (!isnan(lastAccMag)) {
+    float deltaImpact = fabs(accMag - lastAccMag);
+
+    if (deltaImpact > ACC_IMPACT_THRESHOLD) {
+      alert = true;
+      alertImpact = true;
+    }
+  }
+
+  lastAccMag = accMag;
+
+
+    lastAx = ax;
+    lastAy = ay;
+    lastAz = az;
+  }
+
 
     u8g2.clearBuffer();
 
@@ -591,24 +627,40 @@ void loop() {
 
         u8g2.setFont(u8g2_font_6x10_tf);
         int y2 = 40;
+
         if (alertTemp) {
-          u8g2.drawStr(0, y2, "Nhiet do > 33C");
+          u8g2.drawStr(0, y2, "Nhiet do > 31C");
           y2 += 12;
         }
         if (alertHRLow) {
           u8g2.drawStr(0, y2, "Nhip tim < 50 bpm");
+          y2 += 12;
         }
+        if (alertHRHIGH) {
+          u8g2.drawStr(0, y2, "Nhip tim > 100 bpm");
+          y2 += 12;
+        }
+        if (alertRung) {
+          u8g2.drawStr(0, y2, "Rung / Lac manh");
+          y2 += 12;
+        }
+
+         if (alertImpact) {
+          u8g2.drawStr(0, y2, "Va dap manh");
+          y2 += 12;
+         }
+
       }
 
       u8g2.sendBuffer();
       return;
     }
 
-    // Hiển thị bình thường
+    // ===== Hiển thị bình thường =====
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(0, 10, "ESP32 HEALTH MON");
 
-    char line[32];
+    char line[40];
 
     if (haveMAX && validHR) {
       snprintf(line, sizeof(line), "HR  : %3.0f bpm", heartRate);
