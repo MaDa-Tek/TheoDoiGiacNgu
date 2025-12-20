@@ -228,7 +228,7 @@ unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;  // ms
 
 // Chế độ hoạt động: TRUE = SENSOR, FALSE = CLOCK
-bool sensorMode = true;
+bool sensorMode = true;                              
 
 // ================== FLAGS & STATE ==================
 bool haveMAX  = false;
