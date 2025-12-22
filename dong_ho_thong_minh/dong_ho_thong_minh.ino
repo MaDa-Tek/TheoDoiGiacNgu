@@ -16,6 +16,8 @@
 // ================== WiFi & Thời gian thực ==================
 const char* ssid     = "MADATEK";
 const char* password = "Madatek68686868";
+//const char* ssid     = "HEC";
+//const char* password = "vnpttech";
 
 // Việt Nam GMT+7
 const long  gmtOffset_sec      = 7 * 3600;
@@ -27,12 +29,13 @@ const float HUM_OFFSET  = 0.0f;
 
 // ================== OLED SH1106 SPI (U8g2) ==================
 // ESP32: SCK = 18, MOSI = 23, DC = 17, RST = 16, CS = none (GND)
-U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(
+// ================== OLED SH1106 I2C (U8g2) ==================
+// ESP32 I2C: SDA = GPIO21, SCL = GPIO22
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(
   U8G2_R0,
-  U8X8_PIN_NONE, // CS none
-  17,            // DC
-  16             // RST
+  /* reset = */ U8X8_PIN_NONE
 );
+
 
 // ================== MAX30100 REGISTERS ==================
 #define MAX30100_FIFO_WR_PTR    0x02
@@ -82,7 +85,7 @@ bool initMAX30100() {
 
   i2cWrite8(MAX30100_ADDR, MAX30100_MODE_CONFIG, 0x03);  // SpO2 mode
   i2cWrite8(MAX30100_ADDR, MAX30100_SPO2_CONFIG, 0x4F);  // hi-res, 100Hz, 1600us
-  i2cWrite8(MAX30100_ADDR, MAX30100_LED_CONFIG, 0xFF);   // RED/IR current
+  i2cWrite8(MAX30100_ADDR, MAX30100_LED_CONFIG, 0x24);   // RED/IR current
 
   delay(10);
   uint8_t mode = i2cRead8(MAX30100_ADDR, MAX30100_MODE_CONFIG);
@@ -158,31 +161,45 @@ uint16_t redBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 bool bufferFilled = false;
 
-float heartRate = 0;
-bool validHR = false;
-bool lastAbove = false;
-uint32_t lastPeakTime = 0;
+//float heartRate = 0;
+//bool validHR = false;
+//bool lastAbove = false;
+//uint32_t lastPeakTime = 0;
 
 float spo2 = 0;
 bool validSpO2 = false;
 
-bool fingerOnSensor = false;
-float dcIR_ema = 0;
-float acAbsAvg = 0;
-const float DC_ALPHA    = 0.95f;
-const float NOISE_ALPHA = 0.95f;
-const uint32_t MIN_RR_MS     = 400;
-const uint32_t MAX_RR_MS     = 1500;
-const uint32_t REFRACTORY_MS = 300;
+//bool fingerOnSensor = false;
+//float dcIR_ema = 0;
+//float acAbsAvg = 0;
+//const float DC_ALPHA    = 0.95f;
+//const float NOISE_ALPHA = 0.95f;
+//const uint32_t MIN_RR_MS     = 400;
+//const uint32_t MAX_RR_MS     = 1500;
+//const uint32_t REFRACTORY_MS = 300;
 const uint16_t IR_FINGER_ON  = 5000;
 const uint16_t IR_FINGER_OFF = 2000;
 
-const int HR_AVG_N = 5;
-uint16_t rrIntervals[HR_AVG_N];
-int rrIndex = 0;
-int rrCount = 0;
-const float MAX_HR_JUMP = 20.0f;
+//const int HR_AVG_N = 5;
+//uint16_t rrIntervals[HR_AVG_N];
+//int rrIndex = 0;
+//int rrCount = 0;
+//const float MAX_HR_JUMP = 20.0f;
 uint16_t lastIR = 0;
+uint32_t lastBeatMs = 0;
+uint32_t lastRiseMs = 0;
+const uint32_t REFRACTORY_MS = 250;
+
+#define MIN_BEAT_INTERVAL  400   // ~150 bpm
+#define MAX_BEAT_INTERVAL  1500  // ~40 bpm
+#define HR_BUF_SIZE        5
+
+float hrBuf[HR_BUF_SIZE];
+int   hrIdx = 0;
+bool  hrBufFull = false;
+
+float heartRate = 0;
+bool  validHR   = false;
 
 // Globals for SHT30 values
 float g_temperature = NAN;
@@ -219,17 +236,29 @@ uint8_t accHitCount = 0;
 
 // Va đập mạnh (|a|)
 #define ACC_IMPACT_THRESHOLD 2.5f    // g
-
+#define LED_ANTOAN 32
+#define LED_CANHBAO 33 
 // ================== KHỞI TẠO WIFI + THỜI GIAN ==================
 void initWiFiAndTime() {
-  Serial.print("Connecting to WiFi");
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  unsigned long t0 = millis();
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    if (millis() - t0 > 15000) {   // timeout 15s
+      Serial.println("\nWiFi FAILED!");
+      return;
+    }
   }
-  Serial.println(" connected!");
 
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  
   configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Syncing time");
@@ -249,8 +278,8 @@ void sampleMaxAndUpdateHR() {
 
   uint16_t ir = 0, red = 0;
   if (!readMAX30100Raw(ir, red)) return;
-  lastIR = ir;
 
+  // ===== LƯU BUFFER (cho SpO2 – GIỮ NGUYÊN) =====
   irBuffer[bufferIndex]  = ir;
   redBuffer[bufferIndex] = red;
   bufferIndex++;
@@ -259,89 +288,45 @@ void sampleMaxAndUpdateHR() {
     bufferFilled = true;
   }
 
-  int count = bufferFilled ? BUFFER_SIZE : bufferIndex;
-  if (count < 20) return;
-
-  // finger detect
-  if (!fingerOnSensor) {
-    if (ir > IR_FINGER_ON) {
-      fingerOnSensor = true;
-      validHR      = false;
-      heartRate    = 0;
-      rrIndex      = 0;
-      rrCount      = 0;
-      lastPeakTime = 0;
-      lastAbove    = false;
-      dcIR_ema     = ir;
-      acAbsAvg     = 0;
-    } else {
-      validHR = false;
-      return;
-    }
-  } else {
-    if (ir < IR_FINGER_OFF) {
-      fingerOnSensor = false;
-      validHR      = false;
-      heartRate    = 0;
-      rrIndex      = 0;
-      rrCount      = 0;
-      lastPeakTime = 0;
-      lastAbove    = false;
-      return;
-    }
-  }
-
-  // DC filter & AC magnitude
-  if (dcIR_ema == 0) dcIR_ema = ir;
-  else dcIR_ema = DC_ALPHA * dcIR_ema + (1.0f - DC_ALPHA) * ir;
-
-  float ac = ir - dcIR_ema;
-  float acAbs = fabs(ac);
-  acAbsAvg = NOISE_ALPHA * acAbsAvg + (1.0f - NOISE_ALPHA) * acAbs;
-
-  const float MIN_AC = 25.0f;
-  if (acAbsAvg < MIN_AC) {
-    validHR = false;
+  // ===== FINGER DETECT (đơn giản, ổn định) =====
+  if (ir < IR_FINGER_OFF) {
+    validHR   = false;
+    lastBeatMs = 0;
     return;
   }
 
-  float threshold = acAbsAvg * 0.6f;
-  const float MIN_THR = 20.0f;
-  if (threshold < MIN_THR) threshold = MIN_THR;
+  // ===== PHÁT HIỆN BEAT (sườn lên IR) =====
+  bool rising = (ir > lastIR + 50);   // 50–80 tùy tay
+  lastIR = ir;
 
-  bool above = (ac > threshold);
   uint32_t now = millis();
+  if (rising && (now - lastRiseMs) < REFRACTORY_MS)
+    rising = false;
 
-  if (lastPeakTime != 0 && (now - lastPeakTime) < REFRACTORY_MS) {
-    lastAbove = above;
-    return;
-  }
+  if (rising) lastRiseMs = now;
+  if (rising && lastBeatMs > 0) {
+    uint32_t interval = now - lastBeatMs;
 
-  if (!lastAbove && above) {
-    if (lastPeakTime != 0) {
-      uint32_t interval = now - lastPeakTime;
-      if (interval > MIN_RR_MS && interval < MAX_RR_MS) {
-        rrIntervals[rrIndex] = interval;
-        rrIndex = (rrIndex + 1) % HR_AVG_N;
-        if (rrCount < HR_AVG_N) rrCount++;
+    if (interval >= MIN_BEAT_INTERVAL && interval <= MAX_BEAT_INTERVAL) {
+      float hr = 60000.0f / interval;
 
-        float sum = 0;
-        for (int i = 0; i < rrCount; i++) sum += rrIntervals[i];
-        float avgRR = sum / rrCount;
-        float newHR = 60000.0f / avgRR;
-
-        if (validHR && fabs(newHR - heartRate) > MAX_HR_JUMP) {
-          // ignore spike
-        } else {
-          if (!validHR) heartRate = newHR;
-          else heartRate = 0.90f * heartRate + 0.10f * newHR;
-          validHR = true;
-        }
+      // ===== TRUNG BÌNH TRƯỢT =====
+      hrBuf[hrIdx++] = hr;
+      if (hrIdx >= HR_BUF_SIZE) {
+        hrIdx = 0;
+        hrBufFull = true;
       }
+
+      int n = hrBufFull ? HR_BUF_SIZE : hrIdx;
+      float sum = 0;
+      for (int i = 0; i < n; i++) sum += hrBuf[i];
+
+      heartRate = sum / n;
+      validHR   = true;
     }
-    lastPeakTime = now;
   }
-  lastAbove = above;
+
+  if (rising) lastBeatMs = now;
 }
 
 void computeSpO2() {
@@ -399,7 +384,10 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   buttonState       = digitalRead(BUTTON_PIN);
   lastButtonReading = buttonState;
-
+  pinMode(LED_ANTOAN, OUTPUT);
+  pinMode(LED_CANHBAO, OUTPUT);
+  digitalWrite(LED_ANTOAN, LOW);
+  digitalWrite(LED_CANHBAO, LOW);
   u8g2.begin();
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -412,24 +400,18 @@ void setup() {
 // ================== LOOP ==================
 void loop() {
   // ---- Debounce + TOGGLE MODE ----
-  int reading = digitalRead(BUTTON_PIN);
+  static bool lastBtn = HIGH;
+  bool curBtn = digitalRead(BUTTON_PIN);
 
-  if (reading != lastButtonReading) {
-    lastDebounceTime = millis();
+  if (lastBtn == HIGH && curBtn == LOW) {   // cạnh xuống
+    sensorMode = !sensorMode;
+    Serial.print("Mode changed to: ");
+    Serial.println(sensorMode ? "SENSOR" : "CLOCK");
+    delay(200); // debounce đơn giản
   }
 
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != buttonState) {
-      buttonState = reading;
+  lastBtn = curBtn;
 
-      if (buttonState == LOW) {
-        sensorMode = !sensorMode;
-        Serial.print("Mode changed to: ");
-        Serial.println(sensorMode ? "SENSOR" : "CLOCK");
-      }
-    }
-  }
-  lastButtonReading = reading;
 
   // 1) Khởi tạo cảm biến 1 lần
   if (!sensorsInited) {
@@ -484,6 +466,8 @@ void loop() {
 
     // === CLOCK MODE ===
     if (!sensorMode) {
+      digitalWrite(LED_ANTOAN, LOW);
+      digitalWrite(LED_CANHBAO, LOW);
       u8g2.clearBuffer();
 
       struct tm timeinfo;
@@ -509,7 +493,7 @@ void loop() {
         snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", hours, minutes, seconds);
 
         u8g2.setFont(u8g2_font_fub20_tr);
-        u8g2.drawStr(10, 55, timeStr);
+        u8g2.drawStr(10, 45, timeStr);
       }
 
       u8g2.setFont(u8g2_font_5x8_tf);
@@ -618,6 +602,8 @@ void loop() {
     u8g2.clearBuffer();
 
     if (alert) {
+      digitalWrite(LED_ANTOAN, LOW);
+      digitalWrite(LED_CANHBAO, HIGH);
       static bool blinkOn = false;
       blinkOn = !blinkOn;
 
@@ -659,7 +645,8 @@ void loop() {
     // ===== Hiển thị bình thường =====
     u8g2.setFont(u8g2_font_6x10_tf);
     u8g2.drawStr(0, 10, "ESP32 HEALTH MON");
-
+    digitalWrite(LED_ANTOAN, HIGH);
+    digitalWrite(LED_CANHBAO, LOW);
     char line[40];
 
     if (haveMAX && validHR) {
@@ -696,5 +683,4 @@ void loop() {
 
     u8g2.sendBuffer();
   }
-
-)
+}
